@@ -114,3 +114,34 @@ TfLiteTensor* NeuralNetwork::getOutput()
 {
     return output;
 }
+
+int NeuralNetwork::getPredictedClass()
+{
+    TfLiteTensor* out = output;
+
+    int8_t* scores = out->data.int8;
+    float scale = out->params.scale;
+    int zp = out->params.zero_point;
+
+    int best_i = 0;
+    int8_t best_score = scores[0];
+
+    // 5 classes: "_", "1", "2", "3", "4"
+    for (int i = 1; i < 5; i++)
+    {
+        if (scores[i] > best_score)
+        {
+            best_score = scores[i];
+            best_i = i;
+        }
+    }
+
+    float prob = (best_score - zp) * scale;
+
+    const char* labels[5] = {"_", "1", "2", "3", "4"};
+
+    ESP_LOGI("vww_nn", "Predicted: %s (class=%d, raw=%d, prob=%.4f)",
+             labels[best_i], best_i, best_score, prob);
+
+    return best_i;
+}

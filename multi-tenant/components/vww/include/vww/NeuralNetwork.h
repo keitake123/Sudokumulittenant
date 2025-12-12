@@ -43,6 +43,7 @@ public:
     TfLiteTensor* getInput();
     TfLiteStatus predict();
     TfLiteTensor* getOutput();
+    int getPredictedClass(); 
 };
 
 

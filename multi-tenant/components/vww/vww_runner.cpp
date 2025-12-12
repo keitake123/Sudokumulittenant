@@ -1,304 +1,331 @@
 #include "vww/vww.h"
 
-#include <cstdint>
 #include <cstring>
+#include <cmath>
 
-#include "driver/gpio.h"
-#include "driver/ledc.h"
 #include "esp_camera.h"
+#include "esp_err.h"
 #include "esp_log.h"
-#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "soc/rtc_cntl_reg.h"
-#include "soc/soc.h"
 
-#include "vww/NeuralNetwork.h"
 #define CAMERA_MODEL_XIAO_ESP32S3
 #include "vww/camera_pins.h"
-#include "tensorflow/lite/c/common.h"
 
+#include "vww/NeuralNetwork.h"
+
+static const char* TAG = "vww_sudoku";
+
+// ================= CONFIG =================
+#define GRID_SIZE 4
+
+// 🔒 FIXED BOARD CROP (DO NOT CHANGE)
+#define X_LEFT   77
+#define X_RIGHT  253
+#define Y_TOP    57
+#define Y_BOTTOM 233
+
+#define CROP_W (X_RIGHT - X_LEFT)
+#define CROP_H (Y_BOTTOM - Y_TOP)
+
+// ================= GLOBAL BUFFERS =================
+static uint8_t cropped_gray[CROP_W * CROP_H];
+static uint8_t cell_raw[64 * 64];
+static uint8_t cell28[28 * 28];
+
+static int preds[GRID_SIZE][GRID_SIZE];
+
+static NeuralNetwork* s_nn = nullptr;
 static bool s_camera_ok = false;
 
-namespace {
-constexpr int kInputWidth = 96;
-constexpr int kInputHeight = 96;
-constexpr gpio_num_t kLedPin = GPIO_NUM_21;
+// ------------------------------------------------------------
+// PREPROCESS ONE CELL: contrast + resize to 28x28
+// (PASTED FROM YOUR FRIEND — DO NOT CHANGE)
+// ------------------------------------------------------------
+static void preprocess_cell_to_28x28(
+    const uint8_t *cell_in,
+    int cell_w,
+    int cell_h,
+    uint8_t *cell_out
+) {
+    uint8_t minv = 255;
+    uint8_t maxv = 0;
 
-NeuralNetwork *s_network = nullptr;
-const char *TAG = "vww_runner";
-
-uint32_t Rgb565ToRgb888(uint16_t color) {
-  const uint8_t lb = (color >> 8) & 0xFF;
-  const uint8_t hb = color & 0xFF;
-
-  const uint32_t r = (lb & 0x1F) << 3;
-  const uint32_t g = ((hb & 0x07) << 5) | ((lb & 0xE0) >> 3);
-  const uint32_t b = hb & 0xF8;
-
-  return (r << 16) | (g << 8) | b;
-}
-
-esp_err_t FillInputTensor(camera_fb_t *fb, TfLiteTensor *input) {
-  if (!fb || !input) return ESP_ERR_INVALID_ARG;
-
-  if (fb->format != PIXFORMAT_RGB565) {
-    ESP_LOGE(TAG, "Unexpected fb format %d", fb->format);
-    return ESP_ERR_INVALID_STATE;
-  }
-
-  if (!input->dims || input->dims->size != 4) {
-    ESP_LOGE(TAG, "Unexpected input dims");
-    return ESP_ERR_INVALID_STATE;
-  }
-
-  const int inN = input->dims->data[0];
-  const int inH = input->dims->data[1];
-  const int inW = input->dims->data[2];
-  const int inC = input->dims->data[3];
-
-  if (inN != 1) {
-    ESP_LOGE(TAG, "Unexpected batch %d", inN);
-    return ESP_ERR_INVALID_STATE;
-  }
-
-  // Your digit model should be 28x28x1
-  const bool want_gray28 = (inH == 28 && inW == 28 && inC == 1);
-
-  const uint16_t *src = reinterpret_cast<const uint16_t *>(fb->buf);
-
-  auto rgb565_to_rgb888 = [](uint16_t c, uint8_t &r, uint8_t &g, uint8_t &b) {
-    r = ((c >> 11) & 0x1F) << 3;
-    g = ((c >> 5)  & 0x3F) << 2;
-    b = ( c        & 0x1F) << 3;
-  };
-
-  auto rgb_to_gray_u8 = [](uint8_t r, uint8_t g, uint8_t b) -> uint8_t {
-    // cheap luma
-    return (uint8_t)((r * 30 + g * 59 + b * 11) / 100);
-  };
-
-  // Helper: safe quantize a 0..255 value using tensor params
-  auto quant_u8 = [&](int x255) -> int {
-    const float scale = input->params.scale;
-    const int zp = input->params.zero_point;
-
-    if (scale <= 0.0f) {
-      // If scale is broken, fall back to raw centered mapping (best-effort)
-      // This is NOT ideal, but prevents divide-by-zero.
-      return x255 - 128;
+    for (int i = 0; i < cell_w * cell_h; i++) {
+        uint8_t v = cell_in[i];
+        if (v < minv) minv = v;
+        if (v > maxv) maxv = v;
     }
 
-    int q = (int)lroundf((float)x255 / scale) + zp;
-    if (q < -128) q = -128;
-    if (q > 127) q = 127;
-    return q;
-  };
+    int range = maxv - minv;
+    if (range < 30) {
+        memset(cell_out, 0, 28 * 28);
+        return;
+    }
 
-  if (want_gray28) {
-    // Downsample fb->width/height to 28x28, grayscale, fill tensor
-    if (input->type == kTfLiteInt8) {
-      int8_t *dst = input->data.int8;
-      for (int y = 0; y < 28; y++) {
-        int sy = (y * fb->height) / 28;
-        for (int x = 0; x < 28; x++) {
-          int sx = (x * fb->width) / 28;
-          uint8_t r,g,b;
-          rgb565_to_rgb888(src[sy * fb->width + sx], r,g,b);
-          uint8_t gray = rgb_to_gray_u8(r,g,b);
-          *dst++ = (int8_t)quant_u8(gray);
+    for (int oy = 0; oy < 28; oy++) {
+        for (int ox = 0; ox < 28; ox++) {
+
+            int x0 = (ox * cell_w) / 28;
+            int x1 = ((ox + 1) * cell_w) / 28;
+            int y0 = (oy * cell_h) / 28;
+            int y1 = ((oy + 1) * cell_h) / 28;
+
+            if (x1 <= x0) x1 = x0 + 1;
+            if (y1 <= y0) y1 = y0 + 1;
+
+            int sum = 0;
+            int count = 0;
+
+            for (int y = y0; y < y1; y++) {
+                for (int x = x0; x < x1; x++) {
+                    int v = cell_in[y * cell_w + x];
+                    int c = (v - minv) * 255 / range;
+                    if (c < 0) c = 0;
+                    if (c > 255) c = 255;
+                    sum += c;
+                    count++;
+                }
+            }
+
+            uint8_t out = sum / count;
+            cell_out[oy * 28 + ox] = out;
         }
-      }
-      return ESP_OK;
     }
+}
 
-    if (input->type == kTfLiteUInt8) {
-      uint8_t *dst = input->data.uint8;
-      // For uint8 models, quantization is typically identity-ish, but still use params if you want.
-      for (int y = 0; y < 28; y++) {
-        int sy = (y * fb->height) / 28;
-        for (int x = 0; x < 28; x++) {
-          int sx = (x * fb->width) / 28;
-          uint8_t r,g,b;
-          rgb565_to_rgb888(src[sy * fb->width + sx], r,g,b);
-          uint8_t gray = rgb_to_gray_u8(r,g,b);
-          *dst++ = gray;
+// ------------------------------------------------------------
+// Flip vertically (PASTED FROM YOUR FRIEND — DO NOT CHANGE)
+// ------------------------------------------------------------
+static void flip_vertical(uint8_t *img, int w, int h) {
+    for (int y = 0; y < h / 2; y++) {
+        for (int x = 0; x < w; x++) {
+            int top = y * w + x;
+            int bottom = (h - 1 - y) * w + x;
+
+            uint8_t tmp = img[top];
+            img[top] = img[bottom];
+            img[bottom] = tmp;
         }
-      }
-      return ESP_OK;
     }
+}
 
-    if (input->type == kTfLiteFloat32) {
-      float *dst = input->data.f;
-      for (int y = 0; y < 28; y++) {
-        int sy = (y * fb->height) / 28;
-        for (int x = 0; x < 28; x++) {
-          int sx = (x * fb->width) / 28;
-          uint8_t r,g,b;
-          rgb565_to_rgb888(src[sy * fb->width + sx], r,g,b);
-          uint8_t gray = rgb_to_gray_u8(r,g,b);
-          *dst++ = gray / 255.0f; // typical float model normalization
+// ------------------------------------------------------------
+// UINT8 → INT8 normalization (PASTED FROM YOUR FRIEND — DO NOT CHANGE)
+// ------------------------------------------------------------
+static void normalize_uint8_to_int8(
+    const uint8_t *in,
+    int8_t *out,
+    int n,
+    int zero_point,
+    float scale
+) {
+    for (int i = 0; i < n; i++) {
+        // Match training preprocessing EXACTLY
+        float f = in[i] / 255.0f;
+
+        int q = (int)round(f / scale) + zero_point;
+
+        if (q < -128) q = -128;
+        if (q > 127)  q = 127;
+
+        out[i] = (int8_t)q;
+    }
+}
+
+// ------------------------------------------------------------
+// EXTRACT ONE CELL FROM CROPPED BOARD (PASTED FROM YOUR FRIEND — DO NOT CHANGE)
+// ------------------------------------------------------------
+static void extract_cell(
+    const uint8_t *board,
+    int board_w,
+    int board_h,
+    int row,
+    int col,
+    uint8_t *cell_out,
+    int &cell_w,
+    int &cell_h
+) {
+    cell_w = board_w / GRID_SIZE;
+    cell_h = board_h / GRID_SIZE;
+
+    int x0 = col * cell_w;
+    int y0 = row * cell_h;
+
+    int idx = 0;
+    for (int y = 0; y < cell_h; y++) {
+        for (int x = 0; x < cell_w; x++) {
+            cell_out[idx++] = board[(y0 + y) * board_w + (x0 + x)];
         }
-      }
-      return ESP_OK;
+    }
+}
+
+// ---------------------- IDF Camera config ----------------------
+static camera_config_t MakeCameraConfig() {
+    camera_config_t c = {};
+    c.ledc_channel = LEDC_CHANNEL_0;
+    c.ledc_timer   = LEDC_TIMER_0;
+
+    c.pin_d0 = Y2_GPIO_NUM;
+    c.pin_d1 = Y3_GPIO_NUM;
+    c.pin_d2 = Y4_GPIO_NUM;
+    c.pin_d3 = Y5_GPIO_NUM;
+    c.pin_d4 = Y6_GPIO_NUM;
+    c.pin_d5 = Y7_GPIO_NUM;
+    c.pin_d6 = Y8_GPIO_NUM;
+    c.pin_d7 = Y9_GPIO_NUM;
+
+    c.pin_xclk = XCLK_GPIO_NUM;
+    c.pin_pclk = PCLK_GPIO_NUM;
+    c.pin_vsync = VSYNC_GPIO_NUM;
+    c.pin_href  = HREF_GPIO_NUM;
+    c.pin_sccb_sda = SIOD_GPIO_NUM;
+    c.pin_sccb_scl = SIOC_GPIO_NUM;
+    c.pin_pwdn  = PWDN_GPIO_NUM;
+    c.pin_reset = RESET_GPIO_NUM;
+
+    c.xclk_freq_hz = 20000000;
+    c.pixel_format = PIXFORMAT_GRAYSCALE;
+    c.frame_size   = FRAMESIZE_QVGA;
+    c.fb_count     = 1;
+
+    // optional but fine:
+    c.grab_mode   = CAMERA_GRAB_WHEN_EMPTY;
+    c.fb_location = CAMERA_FB_IN_PSRAM;
+
+    return c;
+}
+
+static void RunSudokuOnce() {
+    camera_fb_t* fb = esp_camera_fb_get();
+    if (!fb) {
+        ESP_LOGE(TAG, "Frame capture failed");
+        return;
     }
 
-    ESP_LOGE(TAG, "Unsupported tensor type %d for 28x28x1", input->type);
-    return ESP_ERR_NOT_SUPPORTED;
-  }
+    // sanity: expect GRAYSCALE
+    if (fb->format != PIXFORMAT_GRAYSCALE) {
+        ESP_LOGE(TAG, "Unexpected format %d (expected GRAYSCALE)", fb->format);
+        esp_camera_fb_return(fb);
+        return;
+    }
 
-  // If you ever swap back to a 96x96x3 VWW model, you can keep your old path,
-  // but DO NOT assume fb->len == kInputWidth*kInputHeight*2; use fb->width/height.
-  ESP_LOGE(TAG, "Unexpected input shape [%d,%d,%d,%d] (expected 28x28x1)",
-           inN, inH, inW, inC);
-  return ESP_ERR_INVALID_STATE;
-}
+    uint8_t* img = fb->buf;
 
+    // Crop board (EXACT)
+    for (int y = 0; y < CROP_H; y++) {
+        for (int x = 0; x < CROP_W; x++) {
+            int sx = X_LEFT + x;
+            int sy = Y_TOP  + y;
+            cropped_gray[y * CROP_W + x] = img[sy * fb->width + sx];
+        }
+    }
 
+    ESP_LOGI(TAG, "=== SUDOKU PREDICTION ===");
 
-camera_config_t CreateCameraConfig() {
-  camera_config_t config = {};
-  config.ledc_channel = LEDC_CHANNEL_0;
-  config.ledc_timer = LEDC_TIMER_0;
+    for (int r = 0; r < GRID_SIZE; r++) {
+        for (int c = 0; c < GRID_SIZE; c++) {
 
-  config.pin_d0 = Y2_GPIO_NUM;
-  config.pin_d1 = Y3_GPIO_NUM;
-  config.pin_d2 = Y4_GPIO_NUM;
-  config.pin_d3 = Y5_GPIO_NUM;
-  config.pin_d4 = Y6_GPIO_NUM;
-  config.pin_d5 = Y7_GPIO_NUM;
-  config.pin_d6 = Y8_GPIO_NUM;
-  config.pin_d7 = Y9_GPIO_NUM;
+            int cell_w, cell_h;
+            extract_cell(cropped_gray, CROP_W, CROP_H, r, c, cell_raw, cell_w, cell_h);
 
-  config.pin_xclk = XCLK_GPIO_NUM;
-  config.pin_pclk = PCLK_GPIO_NUM;
-  config.pin_vsync = VSYNC_GPIO_NUM;
-  config.pin_href = HREF_GPIO_NUM;
-  config.pin_sccb_sda = SIOD_GPIO_NUM;
-  config.pin_sccb_scl = SIOC_GPIO_NUM;
-  config.pin_pwdn = PWDN_GPIO_NUM;
-  config.pin_reset = RESET_GPIO_NUM;
+            preprocess_cell_to_28x28(cell_raw, cell_w, cell_h, cell28);
+            flip_vertical(cell28, 28, 28);
 
-  config.xclk_freq_hz = 16000000;              // ✅ lower clock
-  config.frame_size = FRAMESIZE_96X96;
-  config.pixel_format = PIXFORMAT_RGB565;
+            // Debug only for first cell
+            if (r == 0 && c == 0) {
+                uint8_t mn = 255, mx = 0;
+                for (int i = 0; i < 28 * 28; i++) {
+                    uint8_t v = cell28[i];
+                    if (v < mn) mn = v;
+                    if (v > mx) mx = v;
+                }
+                ESP_LOGI(TAG, "CELL28 after preprocess+flip+invert: min=%u max=%u range=%u",
+                         mn, mx, (unsigned)(mx - mn));
+            }
 
-  config.grab_mode = CAMERA_GRAB_LATEST;       // ✅ safer
-  config.fb_location = CAMERA_FB_IN_PSRAM;      // ✅ critical
-  config.jpeg_quality = 12;
-  config.fb_count = 1;
+            TfLiteTensor* input = s_nn->getInput();
 
-  return config;
-}
+            normalize_uint8_to_int8(
+                cell28,
+                input->data.int8,
+                28 * 28,
+                input->params.zero_point,
+                input->params.scale
+            );
 
+            if (r == 0 && c == 0) {
+                int8_t mn = 127, mx = -128;
+                for (int i = 0; i < 28 * 28; i++) {
+                    int8_t v = input->data.int8[i];
+                    if (v < mn) mn = v;
+                    if (v > mx) mx = v;
+                }
+                ESP_LOGI(TAG, "INPUT int8: min=%d max=%d (scale=%f zp=%d)",
+                         mn, mx, input->params.scale, input->params.zero_point);
+            }
 
-void ConfigureLed() {
-  gpio_config_t cfg = {};
-  cfg.mode = GPIO_MODE_OUTPUT;
-  cfg.pin_bit_mask = 1ULL << kLedPin;
-  gpio_config(&cfg);
-  gpio_set_level(kLedPin, 1);
-}
+            if (s_nn->predict() != kTfLiteOk) {
+                ESP_LOGE(TAG, "Inference failed");
+                esp_camera_fb_return(fb);
+                return;
+            }
 
-void ProcessFrame() {
-  camera_fb_t *fb = esp_camera_fb_get();
-  if (!fb) {
-    ESP_LOGW(TAG, "Camera capture failed");
-    return;
-  }
+            int pred = s_nn->getPredictedClass();
+            preds[GRID_SIZE - 1 - r][c] = pred;
+        }
+    }
 
-  const uint64_t start_prep = esp_timer_get_time();
-  if (FillInputTensor(fb, s_network->getInput()) != ESP_OK) {
+    ESP_LOGI(TAG, "=== FINAL PREDICTION GRID ===");
+    for (int r = 0; r < GRID_SIZE; r++) {
+        char line[32];
+        int pos = 0;
+        for (int c = 0; c < GRID_SIZE; c++) {
+            int v = preds[r][c];
+            pos += snprintf(line + pos, sizeof(line) - pos, "%c ",
+                            (v == 0) ? '_' : ('0' + v));
+        }
+        ESP_LOGI(TAG, "%s", line);
+    }
+
     esp_camera_fb_return(fb);
-    return;
-  }
-  const uint64_t dur_prep = esp_timer_get_time() - start_prep;
-
-  const uint64_t start_infer = esp_timer_get_time();
-  if (s_network->predict() != kTfLiteOk) {
-    ESP_LOGE(TAG, "Inference failed");
-    esp_camera_fb_return(fb);
-    return;
-  }
-  const uint64_t dur_infer = esp_timer_get_time() - start_infer;
-
-  esp_camera_fb_return(fb);
-
-  const float prob = s_network->getOutput()->data.f[0];
-  ESP_LOGI(TAG, "Prep: %llums, Infer: %llums, prob=%.3f",
-           dur_prep / 1000ULL, dur_infer / 1000ULL, prob);
-
-  const bool person_detected = prob >= 0.5f;
-  gpio_set_level(kLedPin, person_detected ? 0 : 1);
 }
-}  // namespace
 
 extern "C" esp_err_t vww_init(void) {
-  if (s_network != nullptr) {
-    ESP_LOGI(TAG, "vww_init: network already created");
-    return ESP_OK;
-  }
+    if (s_nn) return ESP_OK;
 
-  ESP_LOGI(TAG, "vww_init: start");
+    camera_config_t cfg = MakeCameraConfig();
+    esp_err_t err = esp_camera_init(&cfg);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Camera init failed: 0x%x", err);
+        s_camera_ok = false;
+        return err;
+    }
+    s_camera_ok = true;
 
-  // leave brownout hack OFF while debugging
-  // WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
-
-  ESP_LOGI(TAG, "vww_init: configuring LED");
-  ConfigureLed();
-  ESP_LOGI(TAG, "vww_init: LED configured");
-
-  // ---- ENABLE CAMERA INIT ----
-  camera_config_t config = CreateCameraConfig();
-  ESP_LOGI(TAG, "vww_init: calling esp_camera_init...");
-  esp_err_t err = esp_camera_init(&config);
-  if (err != ESP_OK) {
-    ESP_LOGE(TAG, "vww_init: Camera init failed: 0x%x", err);
-    s_camera_ok = false;
-    return err;
-  }
-  ESP_LOGI(TAG, "vww_init: Camera init OK");
-  s_camera_ok = true;
-  // ----------------------------
-
-  ESP_LOGI(TAG, "vww_init: creating NeuralNetwork");
-  s_network = new NeuralNetwork();
-  if (!s_network) {
-    ESP_LOGE(TAG, "vww_init: Failed to allocate NeuralNetwork");
-    s_camera_ok = false;
-    return ESP_ERR_NO_MEM;
-  }
-
-  TfLiteTensor* in = s_network->getInput();
-  TfLiteTensor* out = s_network->getOutput();
-  if (!in || !out) {
-    ESP_LOGE(TAG, "vww_init: Neural network tensors unavailable (in=%p out=%p)", in, out);
-    delete s_network;
-    s_network = nullptr;
-    s_camera_ok = false;
-    return ESP_FAIL;
-  }
-
-  ESP_LOGI(TAG, "vww_init: done (camera ok, network ok)");
-  return ESP_OK;
-}
-
-
-extern "C" void vww_task(void *param) {
-  (void)param;
-  ESP_LOGI(TAG, "VWW task started");
-
-  while (true) {
-    if (!s_camera_ok || !s_network) {
-      ESP_LOGW(TAG, "VWW loop: not ready (camera_ok=%d network=%p)",
-               (int)s_camera_ok, s_network);
-      vTaskDelay(pdMS_TO_TICKS(500));
-      continue;
+    s_nn = new NeuralNetwork();
+    if (!s_nn || !s_nn->getInput() || !s_nn->getOutput()) {
+        ESP_LOGE(TAG, "NN init failed");
+        delete s_nn;
+        s_nn = nullptr;
+        return ESP_FAIL;
     }
 
-    ProcessFrame();                 // ✅ runs capture + ML + output
-    vTaskDelay(pdMS_TO_TICKS(50));  // adjust speed
-  }
+    ESP_LOGI(TAG, "Camera + model initialized");
+    return ESP_OK;
 }
 
+extern "C" void vww_task(void* param) {
+    (void)param;
 
+    bool ran_once = false;
+
+    while (true) {
+        if (s_camera_ok && s_nn && !ran_once) {
+            vTaskDelay(pdMS_TO_TICKS(5000));
+            RunSudokuOnce();
+            ran_once = true;
+        }
+        vTaskDelay(pdMS_TO_TICKS(200));
+    }
+}
