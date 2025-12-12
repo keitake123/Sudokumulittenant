@@ -8,6 +8,7 @@
 
 static const char *TAG = "multi_tenant";
 
+// You can keep these even if unused for now
 static void start_kws_task(void) {
   xTaskCreatePinnedToCore(kws_task, "kws_task", 8192, NULL, 4, NULL, 0);
 }
@@ -17,14 +18,15 @@ static void start_vww_task(void) {
 }
 
 void app_main(void) {
-  ESP_LOGI(TAG, "Initializing KWS module");
-  kws_init();
-  start_kws_task();
+  // 🔇 TEMP: disable KWS completely
+  // ESP_LOGI(TAG, "Initializing KWS module");
+  // kws_init();
+  // start_kws_task();
 
   ESP_LOGI(TAG, "Initializing VWW module");
   esp_err_t vision_status = vww_init();
   if (vision_status == ESP_OK) {
-    start_vww_task();
+    start_vww_task();   // or just vww_task(NULL) if it's a blocking loop
   } else {
     ESP_LOGE(TAG, "VWW initialization failed: 0x%x", vision_status);
   }

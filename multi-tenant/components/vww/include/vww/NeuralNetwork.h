@@ -30,7 +30,7 @@ private:
 #if USE_ALLOPS==1
     tflite::AllOpsResolver *resolver;
 #else
-    tflite::MicroMutableOpResolver<13> *resolver;
+    tflite::MicroMutableOpResolver<15> *resolver;
 #endif
     const tflite::Model *model;
     tflite::MicroInterpreter *interpreter;

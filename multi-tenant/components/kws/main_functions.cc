@@ -44,7 +44,7 @@ int32_t previous_time = 0;
 constexpr gpio_num_t kIndicatorGpio = GPIO_NUM_21;
 
 // Increased memory
-constexpr int kTensorArenaSize = 50 * 1024;  // 50KB
+constexpr int kTensorArenaSize = 100 * 1024;  // 50KB
 uint8_t tensor_arena[kTensorArenaSize];
 int8_t feature_buffer[kFeatureElementCount];
 int8_t* model_input_buffer = nullptr;
@@ -278,13 +278,13 @@ void kws_run_once() {
       // Replace Keyword 1 Eg: UP = High beep
       buzzer_tone(FREQ_GO, 300);
       oled_display_command("UP", (uint8_t)(max_result * 100));
-      MicroPrintf("<Keyword 1> - High beep!");
+      MicroPrintf("Start - High beep!");
 
     } else if (max_idx == 3) {
       // Replace Keyword 2 Eg: DOWN = Low beep
       buzzer_tone(FREQ_STOP, 300);
       oled_display_command("DOWN", (uint8_t)(max_result * 100));
-      MicroPrintf("<Keyword 2> - Low beep!");
+      MicroPrintf("Check - Low beep!");
     }
     
     //Recognize commands system is used for proper detection

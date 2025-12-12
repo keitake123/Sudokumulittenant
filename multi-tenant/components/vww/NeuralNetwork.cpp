@@ -27,7 +27,7 @@ NeuralNetwork::NeuralNetwork()
     ESP_LOGI(TAG, "largest size (internal): %d", heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
 
     // get model (.tflite) from flash
-    model = tflite::GetModel(gmodel);
+    model = tflite::GetModel(digit_classifier_int8_tflite);
     if (model->version() != TFLITE_SCHEMA_VERSION)
     {
         MicroPrintf("Model provided is schema version %d not equal to supported "
@@ -38,13 +38,14 @@ NeuralNetwork::NeuralNetwork()
 #if USE_ALLOPS==1
     static tflite::AllOpsResolver micro_op_resolver;
 #else
-    static tflite::MicroMutableOpResolver<13> micro_op_resolver;
+    static tflite::MicroMutableOpResolver<15> micro_op_resolver;
     micro_op_resolver.AddFullyConnected();
     micro_op_resolver.AddConv2D();
     micro_op_resolver.AddDepthwiseConv2D();
     micro_op_resolver.AddMaxPool2D();
     micro_op_resolver.AddMul();
     micro_op_resolver.AddAdd();
+    micro_op_resolver.AddSub();  
     micro_op_resolver.AddLogistic();
     micro_op_resolver.AddTanh();
     micro_op_resolver.AddRelu();
@@ -52,6 +53,7 @@ NeuralNetwork::NeuralNetwork()
     micro_op_resolver.AddReshape();
     micro_op_resolver.AddQuantize();
     micro_op_resolver.AddDequantize();
+    micro_op_resolver.AddSoftmax();  
 #endif
     tensor_arena = static_cast<uint8_t *>(heap_caps_malloc(kTensorArenaSize, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
     if (tensor_arena == NULL)
